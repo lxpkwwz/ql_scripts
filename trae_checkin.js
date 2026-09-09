@@ -33,7 +33,6 @@
  * TRAE_CLAIM_BODY     可选；按实际 claim 请求复制的 JSON 请求体，默认发送 `{}`
  * TRAE_USAGE_PATH     默认 /trae/api/v2/pay/ide_user_ent_usage
  * TRAE_BALANCE        是否查询余额，默认 1；设为 0 关闭
- * TRAE_CREDIT_GROUPS  可选；分类 JSON 数组/对象，自动识别不准时手动标记
  * TRAE_RAW_HEADERS    可选；Reqable 原始请求头文本，私下配置，不要公开
  * TRAE_TIMEOUT        请求超时毫秒数，默认 15000
  * TRAE_AUTHORIZATION  实际请求中的完整 authorization 值，优先级高于 TRAE_HEADERS
@@ -282,131 +281,120 @@ function formatExpiry(value) {
 function formatExpiryDate(value) {
   const dateValue = dateFromValue(value);
   if (!dateValue) return '';
-  return dateValue.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' });
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai', year: 'numeric', month: 'numeric', day: 'numeric',
+  }).formatToParts(dateValue);
+  const values = Object.fromEntries(parts.filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  return `${values.year}/${values.month}/${values.day}`;
 }
 
-function normalizeCreditGroup(value) {
-  const text = String(value || '').trim();
-  if (!text) return '';
-  if (/work\s*专属|专属\s*work/i.test(text)) return 'Work 专属积分';
-  if (/通用|general|global/i.test(text)) return '通用积分';
-  return '';
+function firstValue(object, keys) {
+  if (!object || typeof object !== 'object') return undefined;
+  for (const key of keys) {
+    if (object[key] !== undefined && object[key] !== null && object[key] !== '') return object[key];
+  }
+  return undefined;
 }
 
-function extractCreditGroup(pack) {
-  const candidates = [];
-  const walk = (node, key = '') => {
-    if (!node || candidates.length >= 30) return;
-    if (typeof node === 'string') {
-      if (/(work|专属|通用|general|global)/i.test(node)) candidates.push({ key, value: node });
-      return;
+function extractDetailLimit(object) {
+  const quota = object?.quota || object?.entitlement_quota || {};
+  return toFiniteNumber(firstValue(object, ['credits_limit', 'credit_limit', 'quota_amount', 'total_credits', 'total_amount', 'amount'])
+    ?? firstValue(quota, ['credits_limit', 'credit_limit', 'amount', 'total']));
+}
+
+function extractDetailUsed(object) {
+  const usage = object?.usage || {};
+  return toFiniteNumber(firstValue(object, ['credits_amount', 'used_credits', 'used_amount', 'used'])
+    ?? firstValue(usage, ['credits_amount', 'used_credits', 'used_amount', 'used'])) ?? 0;
+}
+
+function extractDetailTime(object, kind) {
+  const keys = kind === 'grant'
+    ? ['grant_time', 'grantTime', 'issue_time', 'issueTime', 'reward_time', 'rewardTime', 'start_time', 'startTime', 'create_time', 'created_at', 'date']
+    : ['end_time', 'endTime', 'expire_time', 'expireTime', 'expired_at', 'expire_date'];
+  return firstValue(object, keys);
+}
+
+function collectDailyDetailObjects(node, output, depth = 0) {
+  if (!node || typeof node !== 'object' || depth > 8) return;
+  if (Array.isArray(node)) {
+    for (const item of node) {
+      if (!item || typeof item !== 'object') continue;
+      const limit = extractDetailLimit(item);
+      const grantTime = extractDetailTime(item, 'grant');
+      const expire = extractDetailTime(item, 'expire');
+      if (limit !== null && (grantTime || expire)) output.push({ limit, used: extractDetailUsed(item), grantTime, expire });
+      collectDailyDetailObjects(item, output, depth + 1);
     }
-    if (Array.isArray(node)) {
-      node.forEach((item, index) => walk(item, `${key}[${index}]`));
-      return;
-    }
-    if (typeof node === 'object') {
-      for (const [childKey, childValue] of Object.entries(node)) {
-        walk(childValue, key ? `${key}.${childKey}` : childKey);
-      }
-    }
-  };
-  walk(pack);
-  for (const candidate of candidates) {
-    const group = normalizeCreditGroup(candidate.value);
-    if (group) return group;
+    return;
   }
-  if (DEBUG && candidates.length) {
-    console.log(`诊断：权益包存在分类候选但无法规范化：${candidates.map(item => `${item.key}=${item.value}`).join(' | ')}`);
+  for (const value of Object.values(node)) {
+    if (value && typeof value === 'object') collectDailyDetailObjects(value, output, depth + 1);
   }
-  return '';
 }
 
-let creditGroupOverrides;
-
-function loadCreditGroupOverrides() {
-  if (creditGroupOverrides !== undefined) return creditGroupOverrides;
-  creditGroupOverrides = null;
-  const raw = process.env.TRAE_CREDIT_GROUPS || process.env.TRAE_GROUP_MAP || '';
-  if (!raw.trim()) return creditGroupOverrides;
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) || (parsed && typeof parsed === 'object')) creditGroupOverrides = parsed;
-  } catch (error) {
-    if (DEBUG) console.log(`诊断：TRAE_CREDIT_GROUPS 不是有效 JSON：${error.message}`);
+function extractDailyDetailRows(pack, base) {
+  const displayName = String(pack?.display_desc || '');
+  if (!/每日签到|签到奖励/.test(displayName)) return [];
+  const details = [];
+  collectDailyDetailObjects(pack, details);
+  const unique = new Map();
+  for (const detail of details) {
+    const key = JSON.stringify([detail.limit, detail.used, detail.grantTime, detail.expire]);
+    if (!unique.has(key)) unique.set(key, detail);
   }
-  return creditGroupOverrides;
-}
-
-function manualCreditGroup(pack, index, limit, used) {
-  const overrides = loadCreditGroupOverrides();
-  if (!overrides) return '';
-  const name = String(pack?.display_desc || '').trim();
-  const keys = [
-    String(index),
-    `${name}#${limit ?? ''}#${used ?? ''}`,
-    name,
-  ];
-  const value = Array.isArray(overrides)
-    ? overrides[index]
-    : keys.map(key => overrides[key]).find(item => item !== undefined);
-  return normalizeCreditGroup(value);
-}
-
-function fallbackCreditGroup(pack, limit, used) {
-  const name = String(pack?.display_desc || '').trim();
-  if (/每日签到|签到奖励/.test(name)) return 'Work 专属积分';
-  if (/每月登录赠送|免费/.test(name)) return '通用积分';
-  // 当前网页示例中，老用户福利的 Work 专属额度存在已用积分，通用额度尚未使用。
-  if (/老用户福利/.test(name)) {
-    const remaining = limit === null ? null : limit - used;
-    if (remaining !== null && used > 0 && remaining < limit) return 'Work 专属积分';
-    return '通用积分';
-  }
-  return '';
+  return [...unique.values()].map(detail => ({
+    name: '每日签到',
+    limit: detail.limit,
+    used: detail.used,
+    expire: detail.expire || base.end_time,
+  }));
 }
 
 function isDailyCreditRow(row) {
-  return /签到/.test(String(row.name || ''));
+  return /每日签到|签到奖励/.test(String(row.name || ''));
+}
+
+function isDisplayedCreditRow(row) {
+  return isDailyCreditRow(row) || /每月登录赠送/.test(String(row.name || ''));
 }
 
 function compactUsageRows(rows) {
   const compacted = [];
-  const dailyGroups = new Map();
-
+  let daily;
   for (const row of rows) {
     const remain = row.limit === null ? null : row.limit - row.used;
-    // 网页奖励积分列表只展示有明确正数余额的权益；额度未知的元数据项（如“免费”）不展示。
     if (remain === null || remain <= 0) continue;
-
+    if (!isDisplayedCreditRow(row)) continue;
     if (!isDailyCreditRow(row)) {
       compacted.push(row);
       continue;
     }
-
-    const key = row.group || '未分类';
-    let merged = dailyGroups.get(key);
-    if (!merged) {
-      merged = { ...row, name: '每日签到', expiries: [] };
-      dailyGroups.set(key, merged);
-      compacted.push(merged);
+    if (!daily) {
+      daily = { ...row, name: '每日签到', limit: 0, used: 0, expiries: [] };
+      compacted.push(daily);
     }
-    if (row.limit !== null) merged.limit = (merged.limit ?? 0) + row.limit;
-    merged.used += row.used;
-    if (row.expire !== undefined && row.expire !== null && row.expire !== '') merged.expiries.push(row.expire);
+    daily.limit += row.limit ?? 0;
+    daily.used += row.used ?? 0;
+    if (row.expire) daily.expiries.push(row.expire);
   }
   return compacted;
 }
 
 function dailyExpiryText(row) {
-  const dates = (row.expiries || [])
-    .map(dateFromValue)
-    .filter(Boolean)
-    .sort((a, b) => a - b);
+  const dates = (row.expiries || []).map(dateFromValue).filter(Boolean).sort((a, b) => a - b);
   if (dates.length === 0) return '';
   const first = formatExpiryDate(dates[0]);
   const last = formatExpiryDate(dates[dates.length - 1]);
-  return first === last ? `，到期 ${first}` : `，到期 ${first} 至 ${last}`;
+  return first === last ? `，到期 ${first}` : `，到期 ${first}至 ${last}`;
+}
+
+function monthlyLoginLabel() {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', month: 'numeric',
+  }).formatToParts(new Date());
+  const month = parts.find(part => part.type === 'month')?.value || String(new Date().getMonth() + 1);
+  return `${month}月登录赠送`;
 }
 
 async function requestUsage(headers, host) {
@@ -423,22 +411,20 @@ async function requestUsage(headers, host) {
   const packs = Array.isArray(result.user_entitlement_pack_list)
     ? result.user_entitlement_pack_list
     : [];
-  const rows = packs.map((pack) => {
+  const rows = packs.flatMap((pack) => {
     const base = pack?.entitlement_base_info || {};
     const quota = base?.quota || {};
     const usage = pack?.usage || {};
-    const packageExtra = base?.product_extra?.package_extra || {};
     const limit = toFiniteNumber(quota.credits_limit);
     const used = toFiniteNumber(usage.credits_amount) ?? 0;
-    return {
+    const fallbackRow = {
       name: pack?.display_desc || '未命名权益包',
-      group: manualCreditGroup(pack, packs.indexOf(pack), limit, used)
-        || extractCreditGroup(pack)
-        || fallbackCreditGroup(pack, limit, used),
       limit,
       used,
       expire: base.end_time,
     };
+    const detailRows = extractDailyDetailRows(pack, base);
+    return detailRows.length ? detailRows : [fallbackRow];
   });
 
   const numericRows = rows.filter(row => row.limit !== null);
@@ -457,12 +443,10 @@ function formatUsageSummary(name, usage) {
     lines.push(`${name}：剩余可用总积分 ${formatCredits(usage.totalRemain)}`);
     for (const row of rows) {
       const remain = row.limit === null ? '未知' : formatCredits(row.limit - row.used);
-      const group = row.group ? `（${row.group}）` : '';
-      const expiry = row.name === '每日签到' ? dailyExpiryText(row) : (() => {
-        const formatted = formatExpiry(row.expire);
-        return formatted ? `，到期 ${formatted}` : '';
-      })();
-      lines.push(`  ${row.name}${group}：剩余 ${remain}${expiry}`);
+      const isMonthlyLogin = /每月登录赠送/.test(String(row.name || ''));
+      const displayName = isMonthlyLogin ? monthlyLoginLabel() : row.name;
+      const expiry = row.name === '每日签到' ? dailyExpiryText(row) : '';
+      lines.push(`  ${displayName}：剩余 ${remain}${expiry}`);
     }
   }
   return `\n${lines.join('\n')}`;
