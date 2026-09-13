@@ -65,6 +65,18 @@ BASE_URLS = {
     "seek": "https://seekai.cc",
 }
 
+# Turnstile 验证码实际渲染的页面 URL（可能与 API base_url 不同）
+# YesCaptcha 要求 websiteURL 必须与 Turnstile 渲染页面一致，否则解不出来
+SITE_URLS = {
+    "tabitoken": "https://tabitoken.com",
+    "tabi": "https://tabitoken.com",
+    "gorouter": "https://gorouter.app",
+    "justwoker": "https://justwoker.icu",
+    "justdowork": "https://justwoker.icu",
+    "seekai": "https://seekai.cc",
+    "seek": "https://seekai.cc",
+}
+
 # Turnstile 失败时的重试次数（token 可能过期，重新解一次）
 TURNSTILE_MAX_RETRIES = 2
 
@@ -115,7 +127,10 @@ def run_account(acc, yescaptcha_key):
     token = acc.get("token", "")
     user_id = acc.get("user_id")
     base_url = acc.get("url") or BASE_URLS.get(platform)
-    sitekey = SITEKEYS.get(platform)
+    # sitekey：优先用账号配置中的覆盖值，否则用默认映射
+    sitekey = acc.get("sitekey") or SITEKEYS.get(platform)
+    # site_url：Turnstile 实际渲染页面，优先用账号配置，否则用默认映射，最后回退到 base_url
+    site_url = acc.get("site_url") or SITE_URLS.get(platform) or base_url
     if not base_url or not token:
         return f"[FAIL] [{name}] Missing base_url or token"
     headers = {
@@ -142,12 +157,15 @@ def run_account(acc, yescaptcha_key):
 
         # 2. 解 Turnstile + 签到（失败重试）
         for attempt in range(1, TURNSTILE_MAX_RETRIES + 1):
-            ts_token = solve_turnstile(yescaptcha_key, base_url, sitekey)
+            ts_token = solve_turnstile(yescaptcha_key, site_url, sitekey)
             if not ts_token:
                 if attempt < TURNSTILE_MAX_RETRIES:
                     time.sleep(2)
                     continue
-                return f"[FAIL] [{name}] Turnstile solve failed / missing YesCaptcha key"
+                return (
+                    f"[FAIL] [{name}] Turnstile solve failed"
+                    f" (url={site_url}, key={sitekey})"
+                )
             # 3. 提交签到
             r_claim = requests.post(
                 f"{base_url}/api/user/checkin?turnstile={ts_token}",
