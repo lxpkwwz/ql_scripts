@@ -22,6 +22,10 @@ const https = require('https');
 const path = require('path');
 
 const API_ORIGIN = 'https://agent.minimaxi.com';
+const ALLOWED_ORIGINS = new Set([
+  'https://agent.minimaxi.com',
+  'https://agent.minimax.cn',
+]);
 const CLAIM_PATH = '/minimax-cloud/api/v1/signin/claim';
 const CLAIM_ENDPOINT = `${API_ORIGIN}${CLAIM_PATH}`;
 const MEMBERSHIP_PATH = '/matrix/api/v1/commerce/get_membership_info';
@@ -61,21 +65,38 @@ function assertLiveToken(token) {
   return payload;
 }
 
-function parseRequestUrl(rawUrl, expectedPath, label) {
+function cleanPastedUrl(rawUrl) {
+  let value = String(rawUrl || '').replace(/^\uFEFF/, '').trim();
+  // 兼容从青龙变量或聊天窗口复制时附带的外层引号、反引号和换行。
+  if ((value.startsWith('\"') && value.endsWith('\"')) ||
+      (value.startsWith("'") && value.endsWith("'")) ||
+      (value.startsWith('`') && value.endsWith('`'))) {
+    value = value.slice(1, -1).trim();
+  }
+  return value.replace(/[\r\n\t]/g, '');
+}
+
+function parseRequestUrl(rawUrl, expectedPath, label, acceptedPaths = []) {
   let url;
   try {
-    url = new URL(String(rawUrl || '').trim());
+    url = new URL(cleanPastedUrl(rawUrl));
   } catch {
     throw new Error(`${label} 不是有效的完整 URL。`);
   }
-  if (url.protocol !== 'https:' || url.origin !== API_ORIGIN || url.pathname !== expectedPath) {
-    throw new Error(`${label} 必须是 ${API_ORIGIN}${expectedPath} 的完整请求链接。`);
+  if (url.protocol !== 'https:' || !ALLOWED_ORIGINS.has(url.origin) ||
+      (url.pathname !== expectedPath && !acceptedPaths.includes(url.pathname))) {
+    throw new Error(`${label} 必须是 agent.minimax.cn 或 agent.minimaxi.com 域名下的完整请求链接，路径应为 ${expectedPath}。`);
   }
   return url;
 }
 
 function parseSigninUrl(rawUrl) {
-  const url = parseRequestUrl(rawUrl, CLAIM_PATH, 'MINIMAX_SIGNIN_URL');
+  const url = parseRequestUrl(rawUrl, CLAIM_PATH, 'MINIMAX_SIGNIN_URL', [
+    '/minimax-cloud/api/v1/signin/config',
+    '/minimax-cloud/api/v1/signin/status',
+  ]);
+  // config/status 只作为参数来源，真正执行动作必须调用 claim。
+  if (url.pathname !== CLAIM_PATH) url.pathname = CLAIM_PATH;
   const token = String(url.searchParams.get('token') || '').trim();
   const uuid = String(url.searchParams.get('uuid') || '').trim();
   const deviceId = String(url.searchParams.get('device_id') || '').trim();
@@ -108,13 +129,19 @@ function resolveConfig(env = process.env) {
   const signin = parseSigninUrl(env.MINIMAX_SIGNIN_URL);
   const rawBalanceUrl = String(env.MINIMAX_BALANCE_URL || '').trim();
   const balanceQueryRequested = String(env.MINIMAX_BALANCE_QUERY || '1') !== '0';
-  const membership = rawBalanceUrl ? parseMembershipUrl(rawBalanceUrl, signin.token) : null;
+  // 默认从签到 URL 派生余额接口：保留域名、token、设备和用户参数，只替换接口路径。
+  // MINIMAX_BALANCE_URL 仍兼容作为高级用户的可选覆盖项。
+  const derivedBalanceUrl = new URL(signin.url);
+  derivedBalanceUrl.pathname = MEMBERSHIP_PATH;
+  const membership = balanceQueryRequested
+    ? parseMembershipUrl(rawBalanceUrl || derivedBalanceUrl.toString(), signin.token)
+    : null;
   return {
     ...signin,
     membership,
     cookie: String(env.MINIMAX_WEB_COOKIE || '').trim(),
     balanceQuery: balanceQueryRequested && Boolean(membership),
-    balanceSkipReason: !balanceQueryRequested ? '已关闭余额查询' : (!membership ? '未设置 MINIMAX_BALANCE_URL' : ''),
+    balanceSkipReason: !balanceQueryRequested ? '已关闭余额查询' : '',
     notify: String(env.MINIMAX_NOTIFY || '1') !== '0',
     debug: String(env.MINIMAX_DEBUG || '') === '1',
     dryRun: String(env.MINIMAX_DRY_RUN || '') === '1',
@@ -122,13 +149,13 @@ function resolveConfig(env = process.env) {
   };
 }
 
-function baseHeaders(config, token) {
+function baseHeaders(config, token, origin = API_ORIGIN) {
   const headers = {
     Accept: 'application/json, text/plain, */*',
     'Accept-Language': 'zh-CN,zh;q=0.9',
     'Cache-Control': 'no-cache',
     DNT: '1',
-    Origin: API_ORIGIN,
+    Origin: origin,
     Pragma: 'no-cache',
     Referer: `${API_ORIGIN}/`,
     'Sec-CH-UA': '"Not=A?Brand";v="99", "Microsoft Edge";v="151", "Chromium";v="151"',
@@ -151,7 +178,7 @@ function signRequestHeaders(config, url, method, body, nowMs, token) {
   const yyBody = method === 'POST' ? (body || '{}') : '{}';
   const signatureBody = method === 'POST' ? (body || '{}') : '';
   return {
-    ...baseHeaders(config, token),
+    ...baseHeaders(config, token, url.origin),
     'x-timestamp': String(nowSeconds),
     'x-signature': md5(`${nowSeconds}${SIGNATURE_SALT}${signatureBody}`),
     yy: md5(`${encodeURIComponent(hasSearchParamsPath)}_${yyBody}${md5(String(nowMs))}${YY_SUFFIX}`),
@@ -331,13 +358,21 @@ async function main() {
 }
 
 if (require.main === module) {
-  main().catch((error) => {
-    console.error(`[MiniMax] 失败：${error.message}`);
+  main().catch(async (error) => {
+    const message = error?.message || String(error);
+    console.error(`[MiniMax] 失败：${message}`);
+    // resolveConfig、JWT 校验等配置阶段错误也必须通知，不能只写日志。
+    const fallbackConfig = {
+      notify: String(process.env.MINIMAX_NOTIFY || '1') !== '0',
+      dryRun: String(process.env.MINIMAX_DRY_RUN || '') === '1',
+      debug: String(process.env.MINIMAX_DEBUG || '') === '1',
+    };
+    await sendQlNotification({ ok: false, state: '失败', detail: message, summary: {} }, fallbackConfig);
     process.exitCode = 1;
   });
 }
 
 module.exports = {
-  md5, decodeJwtPayload, parseSigninUrl, parseMembershipUrl, resolveConfig,
+  md5, decodeJwtPayload, cleanPastedUrl, parseRequestUrl, parseSigninUrl, parseMembershipUrl, resolveConfig,
   buildSigninRequest, buildMembershipRequest, judgeSignin, parseMembershipBalance, formatResult,
 };
