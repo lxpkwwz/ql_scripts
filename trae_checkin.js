@@ -38,9 +38,189 @@
  * TRAE_AUTHORIZATION  实际请求中的完整 authorization 值，优先级高于 TRAE_HEADERS
  * TRAE_NOTIFY         是否通知，默认 1；设为 0 可关闭
  * TRAE_DEBUG          是否输出接口地址诊断，设为 1；不会输出请求头
+ *
+ * 持久认证推荐配置：
+ * TRAE_REFRESH_TOKEN  网页 OAuth 或官方客户端导出的 refreshToken
+ * TRAE_UID            稳定的账号标识，单账号可填账号1
+ * TRAE_TOKEN_CACHE    续期缓存路径，默认 /ql/data/config/trae-token-cache.json
+ * TRAE_CLIENT_ID      默认 en1oxy7wnw8j9n，一般不要修改
+ * TRAE_EXCHANGE_URL   可选的续期接口覆盖地址
  */
 
 'use strict';
+
+
+// ================= 持久认证：refreshToken 自动续期 =================
+const fs = require('node:fs');
+const TOKEN_CACHE_FILE = process.env.TRAE_TOKEN_CACHE || '/ql/data/config/trae-token-cache.json';
+const REFRESH_TIMEOUT = Number(process.env.TRAE_REFRESH_TIMEOUT || 15000);
+const REFRESH_CLIENT_ID = process.env.TRAE_CLIENT_ID || 'en1oxy7wnw8j9n';
+const REFRESH_URLS = [
+  process.env.TRAE_EXCHANGE_URL || 'https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken',
+  'https://api.trae.cn/trae/api/v3/oauth/ExchangeToken',
+];
+
+function persistentReadJson(file, fallback) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
+}
+
+function persistentWriteJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.renameSync(temp, file);
+}
+
+function persistentJwtExp(token) {
+  try {
+    const part = String(token).split('.')[1];
+    const payload = JSON.parse(Buffer.from(part, 'base64url').toString('utf8'));
+    return Number(payload.exp || 0);
+  } catch { return 0; }
+}
+
+function persistentTokenUsable(token, margin = 120) {
+  const exp = persistentJwtExp(token);
+  return Boolean(token && exp && exp > Math.floor(Date.now() / 1000) + margin);
+}
+
+function persistentAccounts() {
+  if (process.env.TRAE_ACCOUNTS) {
+    const list = JSON.parse(process.env.TRAE_ACCOUNTS);
+    if (!Array.isArray(list) || !list.length) throw new Error('TRAE_ACCOUNTS 必须是非空 JSON 数组');
+    return list.map((account, index) => ({
+      ...account,
+      name: account.name || account.uid || `账号${index + 1}`,
+      uid: account.uid || account.name || String(index + 1),
+    }));
+  }
+  return [{
+    name: process.env.TRAE_UID || '账号1',
+    uid: process.env.TRAE_UID || '1',
+    accessToken: process.env.TRAE_ACCESS_TOKEN || '',
+    refreshToken: process.env.TRAE_REFRESH_TOKEN || '',
+    headers: {},
+  }];
+}
+
+async function persistentPostJson(url, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REFRESH_TIMEOUT);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json',
+        // refresh-token 分支要求为空，不能放旧 access token。
+        'x-cloudide-token': '',
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const text = await response.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch {
+      throw new Error(`续期响应不是 JSON（HTTP ${response.status}）`);
+    }
+    if (!response.ok) {
+      const message = data?.ResponseMetadata?.Error?.Message || data?.message || data?.msg || '';
+      throw new Error(`HTTP ${response.status}${message ? `：${message}` : ''}`);
+    }
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function persistentResult(data) {
+  return data?.Result || data?.result || data?.data || data || {};
+}
+
+async function persistentRefresh(refreshToken) {
+  let lastError;
+  for (const url of REFRESH_URLS) {
+    try {
+      // 适用于网页 OAuth refreshToken；不伪造设备签名。
+      const data = await persistentPostJson(url, {
+        ClientID: REFRESH_CLIENT_ID,
+        RefreshToken: refreshToken,
+        ClientSecret: '-',
+        UserID: '',
+      });
+      const result = persistentResult(data);
+      const accessToken = result.Token || result.token || result.AccessToken || result.accessToken;
+      const rotatedRefreshToken = result.RefreshToken || result.refreshToken || refreshToken;
+      if (!accessToken) throw new Error('续期响应中没有新的 accessToken');
+      return { accessToken, refreshToken: rotatedRefreshToken };
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error('没有可用的续期接口');
+}
+
+async function preparePersistentAuth() {
+  const accounts = persistentAccounts();
+  const cache = persistentReadJson(TOKEN_CACHE_FILE, {});
+  // 没有任何持久认证配置时，不接管原脚本的旧环境变量回退链。
+  if (!process.env.TRAE_ACCOUNTS
+    && !process.env.TRAE_REFRESH_TOKEN
+    && !process.env.TRAE_ACCESS_TOKEN
+    && Object.keys(cache).length === 0) {
+    return;
+  }
+  let cacheChanged = false;
+
+  for (let index = 0; index < accounts.length; index += 1) {
+    const account = accounts[index];
+    const key = String(account.uid || account.name || index + 1);
+    const old = cache[key] || {};
+    let accessToken = account.accessToken || old.accessToken || '';
+    let refreshToken = account.refreshToken || old.refreshToken || '';
+
+    if (refreshToken && !persistentTokenUsable(accessToken)) {
+      try {
+        const fresh = await persistentRefresh(refreshToken);
+        accessToken = fresh.accessToken;
+        refreshToken = fresh.refreshToken || refreshToken;
+        console.log(`${account.name}：已自动续期认证 Token`);
+        cacheChanged = true;
+      } catch (error) {
+        console.log(`${account.name}：自动续期失败，回退旧认证方式（${error.message || error}）`);
+      }
+    }
+
+    if (accessToken) {
+      const headers = { ...(account.headers || {}) };
+      delete headers.authorization;
+      delete headers.Authorization;
+      account.headers = { ...headers, Authorization: `Cloud-IDE-JWT ${accessToken}` };
+    }
+    if (accessToken || refreshToken) {
+      cache[key] = {
+        accessToken,
+        refreshToken,
+        expiresAt: persistentJwtExp(accessToken),
+        updatedAt: Date.now(),
+      };
+      cacheChanged = true;
+    }
+  }
+
+  if (cacheChanged) {
+    try {
+      persistentWriteJson(TOKEN_CACHE_FILE, cache);
+    } catch (error) {
+      console.log(`认证缓存写入失败：${error.message || error}`);
+    }
+  }
+
+  // 让原有 buildAccounts 使用经过续期的多账号数据。
+  process.env.TRAE_ACCOUNTS = JSON.stringify(accounts);
+  delete process.env.TRAE_AUTHORIZATION;
+  delete process.env.TRAE_TOKEN;
+}
 
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -644,6 +824,7 @@ async function sendNotification(title, content) {
 }
 
 async function main() {
+  await preparePersistentAuth();
   const accounts = buildAccounts();
   const results = [];
   let failed = false;
