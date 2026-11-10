@@ -17,7 +17,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 # 待监控的仓库列表，格式：用户名/仓库名
 REPOS = [
-    "Xb-Fishing/qq-farm-evolution",
+    "602832789/qq-farm-bot",
     "BuildAtDawn/qq-farm-bot",
     #"liyangpengs/qq-farm-bot",
 
