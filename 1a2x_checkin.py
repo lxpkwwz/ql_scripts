@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# new Env: '1A2X 社区签到';
 # -*- coding: utf-8 -*-
 """
 1A2X 社区（https://1a2x.com）每日签到脚本 —— 青龙面板
@@ -287,6 +288,16 @@ def extract_growth_info(page_html):
     m = re.search(r"连续签到[^\d]{0,6}([\d,]+)\s*天", text)
     if m:
         info["streak"] = to_int(m.group(1))
+
+    for pat in (
+        r"当前等级[^\d]{0,8}(\d+)",
+        r"等级\s*LV\.?\s*(\d+)",
+        r"\bLV\.?\s*(\d+)",
+    ):
+        m = re.search(pat, text, re.I)
+        if m:
+            info["level"] = to_int(m.group(1))
+            break
 
     for pat in (
         r"(?:香蕉余额|当前余额|我的余额|余额)[^\d]{0,8}([\d,]+)",
@@ -978,13 +989,40 @@ def checkin_for_account(sess):
     return ok, msg
 
 
-def current_balance(sess):
-    """读取成长页当前香蕉余额，失败返回 None。"""
+def current_growth_info(sess):
+    """读取成长页当前信息（余额、等级等），失败返回空字典。"""
     try:
-        info = extract_growth_info(fetch_growth_html(sess) or "")
-        return info.get("balance")
+        return extract_growth_info(fetch_growth_html(sess) or "")
     except Exception:
-        return None
+        return {}
+
+
+def checkin_line(msg, ok):
+    """通知用签到行：签到成功，流水 +5 / 失败，原因。"""
+    if not ok:
+        return "失败，{}".format(msg)
+    if msg.startswith("今日已签到"):
+        base = "今日已签到"
+    elif msg.startswith("签到成功"):
+        base = "签到成功"
+    else:
+        base = msg.split("，", 1)[0]
+    m = re.search(r"流水 \+(\d+)", msg)
+    if m:
+        return "{}，流水 +{}".format(base, m.group(1))
+    return base
+
+
+def reply_line(text):
+    """通知用回复行：回复 10 条，确认 +10。"""
+    m = re.match(r"回复 (\d+) 条（(确认|预计) \+(\d+) 香蕉）(.*)$", text)
+    if not m:
+        return text
+    line = "回复 {} 条，{} +{}".format(m.group(1), m.group(2), m.group(3))
+    tail = m.group(4).lstrip("；; ").strip()
+    if tail:
+        line += "（{}）".format(tail)
+    return line
 
 
 def clean_name(value):
@@ -1048,30 +1086,30 @@ def run_account(index, cookie):
 
         ok, msg = checkin_for_account(sess)
         log("签到结果: {} {}".format("成功" if ok else "失败", msg))
-        checkin_part = msg if ok else "失败，{}".format(msg)
+        checkin_part = checkin_line(msg, ok)
 
         reply_part = "未开启"
         if ok and REPLY_ENABLED and REPLY_COUNT > 0:
             _, reply_msg = reply_for_account(sess)
-            reply_part = reply_msg
+            reply_part = reply_line(reply_msg)
             msg += "；" + reply_msg
             log("回复结果: {}".format(reply_msg))
         elif not ok:
             reply_part = "未执行（签到失败）"
 
-        balance = current_balance(sess)
-        balance_part = "读取失败"
+        info = current_growth_info(sess)
+        balance = info.get("balance")
+        level = info.get("level")
         if balance is not None:
-            balance_part = "当前 {} 香蕉".format(balance)
             msg += "；当前余额 {} 香蕉".format(balance)
             log("当前余额: {} 香蕉".format(balance))
 
         log("结果: {} {}".format("成功" if ok else "失败", msg))
-        parts = {"checkin": checkin_part, "reply": reply_part, "balance": balance_part}
+        parts = {"checkin": checkin_part, "reply": reply_part, "balance": balance, "level": level}
         return ok, msg, name, parts
     except Exception as e:
         log("异常: {}".format(e))
-        parts = {"checkin": "异常，{}".format(e), "reply": "未执行", "balance": "未读取"}
+        parts = {"checkin": "异常，{}".format(e), "reply": "未执行", "balance": None, "level": None}
         return False, str(e), name, parts
     finally:
         sess.close()
@@ -1110,13 +1148,18 @@ def main():
         title = "1A2X 签到失败 {}/{}".format(len(results) - success, len(results))
     blocks = []
     for i, (_, _, name, parts) in enumerate(results, 1):
-        label = "账号{}{}：".format(i, "（{}）".format(name) if name else "")
+        level = parts.get("level")
+        balance = parts.get("balance")
+        level_text = "等级LV {}".format(level) if level is not None else "等级未知"
+        balance_text = (
+            "当前余额 {} 香蕉。".format(balance) if balance is not None else "当前余额 读取失败。"
+        )
         blocks.append(
             "\n".join([
-                label,
-                "签到：{}；".format(parts["checkin"]),
-                "回复：{}；".format(parts["reply"]),
-                "余额：{}。".format(parts["balance"]),
+                "账号 {} {}；".format(name or i, level_text),
+                "{}；".format(parts["checkin"]),
+                "{}；".format(parts["reply"]),
+                balance_text,
             ])
         )
     content = "\n\n".join(blocks)
