@@ -19,7 +19,7 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 REPOS = [
     "602832789/qq-farm-bot",
     "BuildAtDawn/qq-farm-bot",
-    #"liyangpengs/qq-farm-bot",
+    "liyangpengs/qq-farm-bot",
 
     "develop202/kgcheckin",
     "bia-pain-bache/BPB-Worker-Panel",
