@@ -1,50 +1,63 @@
 /*
- * Trae Work 每日签到 - 青龙 Node.js 脚本
+ * Trae Work 每日签到 · 青龙单文件版
  *
- * 定时示例：0 8 * * *
+ * 功能：自动续期 Token、每日签到、查询剩余积分、合并每日签到余额、
+ *       企业微信/青龙通知、每日状态去重、限流冷却、多账号错峰。
  *
- * 推荐环境变量：
- * TRAE_ACCOUNTS = JSON 数组，每个元素格式：
- * [
- *   {
- *     "name": "账号1",
- *     "headers": {
- *       "Cookie": "从实际签到请求复制的 Cookie",
- *       "Authorization": "从实际签到请求复制的 authorization Token",
- *       "User-Agent": "可选",
- *       "Origin": "https://work.trae.cn",
- *       "Referer": "https://work.trae.cn/"
- *     }
- *   }
- * ]
+ * 推荐定时任务：
+ *   node /ql/data/scripts/trae_checkin_merged.js
  *
- * 单账号也可以只配置：
- * TRAE_HEADERS = {"Authorization":"...","Cookie":"..."}
+ * 【推荐配置：持久认证】
+ * 单账号：
+ *   TRAE_ACCOUNTS=[{"name":"账号1","uid":"account1","refreshToken":"...","deviceId":"..."}]
  *
- * 如果只拿到了 Cookie，可配置 TRAE_COOKIE。推荐把实际签到请求中的完整
- * authorization 请求头值原样放入 TRAE_AUTHORIZATION，不要手动猜测前缀。
- * TRAE_TOKEN 仅作为兼容旧配置的简化写法。
+ * 多账号：
+ *   TRAE_ACCOUNTS=[
+ *     {"name":"账号1","uid":"account1","refreshToken":"...","deviceId":"..."},
+ *     {"name":"账号2","uid":"account2","refreshToken":"...","deviceId":"..."}
+ *   ]
  *
- * 可选环境变量：
- * TRAE_API_HOST       主 API 主机；默认 https://api.trae.cn
- * TRAE_API_HOSTS      多个候选主机，逗号或换行分隔；用于旧域名自动回退
- * TRAE_STATUS_PATH    默认 /trae/api/v2/ug/checkin_credits/status
- * TRAE_CLAIM_PATH     默认 /trae/api/v2/ug/checkin_credits/claim
- * TRAE_CLAIM_BODY     可选；按实际 claim 请求复制的 JSON 请求体，默认发送 `{}`
- * TRAE_USAGE_PATH     默认 /trae/api/v2/pay/ide_user_ent_usage
- * TRAE_BALANCE        是否查询余额，默认 1；设为 0 关闭
- * TRAE_RAW_HEADERS    可选；Reqable 原始请求头文本，私下配置，不要公开
- * TRAE_TIMEOUT        请求超时毫秒数，默认 15000
- * TRAE_AUTHORIZATION  实际请求中的完整 authorization 值，优先级高于 TRAE_HEADERS
- * TRAE_NOTIFY         是否通知，默认 1；设为 0 可关闭
- * TRAE_DEBUG          是否输出接口地址诊断，设为 1；不会输出请求头
+ * 字段说明：
+ *   name          通知中显示的名称
+ *   uid           稳定且唯一的账号标识，用于区分缓存和状态
+ *   refreshToken  从 Trae 客户端/网页登录流程获取的可续期凭据
+ *   deviceId      当前成功签到请求中的 x-device-id，可选但 9004 时建议填写
+ *   headers       可放 x-market-client-id、x-user-region、package-type、app-version、User-Agent 等
  *
- * 持久认证推荐配置：
- * TRAE_REFRESH_TOKEN  网页 OAuth 或官方客户端导出的 refreshToken
- * TRAE_UID            稳定的账号标识，单账号可填账号1
- * TRAE_TOKEN_CACHE    续期缓存路径，默认 /ql/data/config/trae-token-cache.json
- * TRAE_CLIENT_ID      默认 en1oxy7wnw8j9n，一般不要修改
- * TRAE_EXCHANGE_URL   可选的续期接口覆盖地址
+ * 注意：TRAE_ACCOUNTS 中的 JSON 必须在青龙环境变量里写成一行。
+ * 不要把旧的 authorization、完整 Cookie 或 Reqable 动态签名头长期写入配置。
+ * 脚本会自动续期并保存最新 Token。
+ *
+ * 【单账号简化配置】
+ *   TRAE_REFRESH_TOKEN=...
+ *   TRAE_UID=账号1
+ *   TRAE_DEVICE_ID=真实 x-device-id（可选）
+ *
+ * 【认证缓存】
+ *   TRAE_TOKEN_CACHE=/ql/data/config/trae-token-cache.json
+ * 默认使用上面的路径，保存自动轮换后的 accessToken/refreshToken。
+ * 不要删除，也不要让多个任务同时刷新同一账号。
+ *
+ * 【签到与余额接口】
+ *   TRAE_API_HOST       默认 https://api.trae.cn
+ *   TRAE_STATUS_PATH    默认 /trae/api/v2/ug/checkin_credits/status
+ *   TRAE_CLAIM_PATH     默认 /trae/api/v2/ug/checkin_credits/claim
+ *   TRAE_CLAIM_BODY     默认 `{}`；如果真实成功请求体不同，可覆盖
+ *   TRAE_USAGE_PATH     默认 /trae/api/v2/pay/ide_user_ent_usage
+ *   TRAE_BALANCE        默认 1；设为 0 关闭余额查询
+ *
+ * 【运行控制】
+ *   TRAE_STATE_FILE     默认 /ql/data/config/trae-checkin-state.json
+ *   TRAE_SKIP_DONE      默认 1；设为 0 不跳过当天已处理账号
+ *   TRAE_JITTER         默认随机等待 0~20 秒；设为 0 关闭
+ *   TRAE_GAP_MIN/MAX    多账号间隔，默认 12/25 秒
+ *   TRAE_COOLDOWN_MIN   9074/429 限流后的账号冷却时间，默认 55 分钟
+ *   TRAE_NOTIFY         默认 1；设为 0 关闭通知
+ *   TRAE_DEBUG          默认 0；设为 1 输出接口诊断，不输出请求头
+ *
+ * 【旧配置兼容】
+ *   TRAE_AUTHORIZATION、TRAE_COOKIE、TRAE_HEADERS、TRAE_RAW_HEADERS、TRAE_TOKEN
+ * 仍可使用，但这些抓包凭据会过期，优先改用 TRAE_REFRESH_TOKEN。
  */
 
 'use strict';
@@ -59,6 +72,11 @@ const REFRESH_URLS = [
   process.env.TRAE_EXCHANGE_URL || 'https://api.trae.com.cn/cloudide/api/v3/trae/oauth/ExchangeToken',
   'https://api.trae.cn/trae/api/v3/oauth/ExchangeToken',
 ];
+const STATE_FILE = process.env.TRAE_STATE_FILE || '/ql/data/config/trae-checkin-state.json';
+const SKIP_DONE = process.env.TRAE_SKIP_DONE !== '0';
+const COOLDOWN_MIN = Math.max(1, Number(process.env.TRAE_COOLDOWN_MIN || 55));
+const GAP_MIN = Math.max(0, Number(process.env.TRAE_GAP_MIN || 12));
+const GAP_MAX = Math.max(GAP_MIN, Number(process.env.TRAE_GAP_MAX || 25));
 
 function persistentReadJson(file, fallback) {
   try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return fallback; }
@@ -84,6 +102,43 @@ function persistentTokenUsable(token, margin = 120) {
   return Boolean(token && exp && exp > Math.floor(Date.now() / 1000) + margin);
 }
 
+function readRunState() {
+  const state = persistentReadJson(STATE_FILE, {});
+  return state && typeof state === 'object' ? state : {};
+}
+
+function writeRunState(state) {
+  try { persistentWriteJson(STATE_FILE, state); }
+  catch (error) { console.log(`签到状态写入失败：${error.message || error}`); }
+}
+
+function accountStateKey(account, index) {
+  return String(account.uid || account.name || index + 1);
+}
+
+function beijingDate() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai' }).format(new Date());
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRateLimited(error) {
+  const message = String(error?.message || error || '');
+  return Number(error?.status) === 429
+    || /\b(429|9074)\b/.test(message)
+    || /rate.?limit|too many|参与用户过多|请求过于频繁/i.test(message);
+}
+
+function markCooldown(state, key, reason) {
+  state[key] = { ...(state[key] || {}), cooldownUntil: Date.now() + COOLDOWN_MIN * 60 * 1000, reason };
+}
+
+function isCoolingDown(state, key) {
+  return Number(state[key]?.cooldownUntil || 0) > Date.now();
+}
+
 function persistentAccounts() {
   if (process.env.TRAE_ACCOUNTS) {
     const list = JSON.parse(process.env.TRAE_ACCOUNTS);
@@ -92,6 +147,7 @@ function persistentAccounts() {
       ...account,
       name: account.name || account.uid || `账号${index + 1}`,
       uid: account.uid || account.name || String(index + 1),
+      deviceId: account.deviceId || account.realDeviceId || '',
     }));
   }
   return [{
@@ -99,6 +155,7 @@ function persistentAccounts() {
     uid: process.env.TRAE_UID || '1',
     accessToken: process.env.TRAE_ACCESS_TOKEN || '',
     refreshToken: process.env.TRAE_REFRESH_TOKEN || '',
+    deviceId: process.env.TRAE_DEVICE_ID || '',
     headers: {},
   }];
 }
@@ -195,6 +252,9 @@ async function preparePersistentAuth() {
       const headers = { ...(account.headers || {}) };
       delete headers.authorization;
       delete headers.Authorization;
+      if (account.deviceId && !headers['x-device-id'] && !headers['X-Device-Id']) {
+        headers['x-device-id'] = String(account.deviceId);
+      }
       account.headers = { ...headers, Authorization: `Cloud-IDE-JWT ${accessToken}` };
     }
     if (accessToken || refreshToken) {
@@ -670,7 +730,7 @@ async function checkOne(account) {
   }
 
   const claimUrl = `${statusResult.host}${CLAIM_PATH}`;
-  // Reqable 抓到的真实桌面端 claim 请求体为 {}（content-length: 2）。
+  // 以当前客户端抓到的成功请求为准；未配置时发送空 JSON 对象。
   const claimBody = parseOptionalBody('TRAE_CLAIM_BODY') ?? '{}';
   if (DEBUG) {
     console.log(`诊断：调用领取接口 ${claimUrl}`);
@@ -682,7 +742,7 @@ async function checkOne(account) {
   if (code !== undefined && Number(code) !== 0) {
     const message = getErrorMessage(claim);
     if (Number(code) === 9004) {
-      throw new Error(`${message}（code: 9004）；领取接口参数与当前账号/客户端状态不匹配。请复制 claim 请求的完整 authorization、Cookie、请求体，并分别配置 TRAE_AUTHORIZATION、TRAE_COOKIE、TRAE_CLAIM_BODY；不要重复重试`);
+      throw new Error(`${message}（code: 9004）；当前 Token 可用，但 claim 参数与客户端状态不匹配。请在 TRAE_ACCOUNTS 中补充真实成功请求的 deviceId（对应 x-device-id）和必要的客户端 headers；请求体默认使用 {}，只有真实成功请求不同才设置 TRAE_CLAIM_BODY；不要连续重复重试`);
     }
     throw new Error(`${message}（code: ${code}）`);
   }
@@ -828,24 +888,73 @@ async function main() {
   const accounts = buildAccounts();
   const results = [];
   let failed = false;
+  const today = beijingDate();
+  const state = readRunState();
+  if (state.date !== today) {
+    for (const key of Object.keys(state)) delete state[key];
+    state.date = today;
+  }
 
   console.log(`Trae Work 签到开始，共 ${accounts.length} 个账号`);
   if (DEBUG) console.log(`诊断：API 主机候选 ${API_HOSTS.join(' , ')}`);
+  const jitterMax = Math.max(0, Number(process.env.TRAE_JITTER || 20));
+  if (jitterMax > 0) {
+    const jitter = Math.floor(Math.random() * (jitterMax + 1));
+    if (jitter > 0) {
+      console.log(`启动随机错峰等待 ${jitter} 秒`);
+      await sleep(jitter * 1000);
+    }
+  }
 
-  for (const account of accounts) {
+  let attemptedClaim = false;
+  for (let index = 0; index < accounts.length; index += 1) {
+    const account = accounts[index];
+    const name = account.name || '未命名账号';
+    const key = accountStateKey(account, index);
+    const saved = state[key] || {};
+    if (SKIP_DONE && saved.date === today && saved.done === true) {
+      const message = `${name}：今天已经处理，跳过重复请求`;
+      console.log(message);
+      results.push(`成功：${message}`);
+      continue;
+    }
+    if (isCoolingDown(state, key)) {
+      const minutes = Math.ceil((state[key].cooldownUntil - Date.now()) / 60000);
+      const message = `${name}：触发限流，冷却中，约 ${minutes} 分钟后重试`;
+      console.log(message);
+      results.push(`待重试：${message}`);
+      continue;
+    }
+    if (attemptedClaim && GAP_MAX > 0) {
+      const gap = GAP_MIN + Math.floor(Math.random() * (GAP_MAX - GAP_MIN + 1));
+      if (gap > 0) {
+        console.log(`账号间错峰等待 ${gap} 秒`);
+        await sleep(gap * 1000);
+      }
+    }
     try {
       const result = await checkOne(account);
       console.log(result);
       results.push(`成功：${result}`);
+      state[key] = { date: today, done: true, updatedAt: Date.now() };
+      writeRunState(state);
     } catch (error) {
-      failed = true;
-      const name = account.name || '未命名账号';
       const message = `${name}：${error.message || error}`;
-      console.log(`失败：${message}`);
-      results.push(`失败：${message}`);
+      if (isRateLimited(error)) {
+        markCooldown(state, key, message);
+        writeRunState(state);
+        console.log(`待重试：${message}；已冷却 ${COOLDOWN_MIN} 分钟`);
+        results.push(`待重试：${message}`);
+      } else {
+        failed = true;
+        console.log(`失败：${message}`);
+        results.push(`失败：${message}`);
+      }
     }
+    attemptedClaim = true;
   }
 
+  writeRunState(state);
   const content = results.join('\n');
   await sendNotification('Trae Work 每日签到', content);
   if (failed) process.exitCode = 1;
