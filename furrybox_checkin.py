@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 cron: 5 0 * * *
-new Env('FurryBox每日签到')
+new Env('FurryBox免费域名每日签到')
 FurryBox 每日签到 — 青龙面板 Python 脚本（含通知）
 
 站点: https://my.furry.box/wallet
@@ -307,7 +307,7 @@ def main():
                "去浏览器 https://my.furry.box/wallet 按 F12 → Application → Cookies "
                "→ .furry.box，复制 fbx_rt 填到青龙环境变量 FURRY_REFRESH_TOKEN。")
         print(msg)
-        notify("FurryBox签到失败", msg)
+        notify("FurryBox免费域名每日签到失败", msg)
         return
 
     results = []
@@ -321,7 +321,7 @@ def main():
         if i < accounts - 1:
             time.sleep(2)
 
-    title = "FurryBox免费域名签到"
+    title = "FurryBox免费域名每日签到"
     content = f"{today_cst()} (北京时间)\n" + "\n".join(results)
     print(content)
     notify(title, content)
